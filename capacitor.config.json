@@ -1,0 +1,17 @@
+{
+  "appId": "com.uniteam.attendance.v3",
+  "appName": "Uniteam",
+  "webDir": "dist",
+  "bundledWebRuntime": false,
+  "server": {
+    "url": "https://rtmteam.github.io/Uniteam-v6/",
+    "cleartext": true,
+    "androidScheme": "https",
+    "errorPath": "offline.html"
+  },
+  "android": {
+    "allowMixedContent": true,
+    "captureInput": true,
+    "backgroundColor": "#0A1428"
+  }
+}
