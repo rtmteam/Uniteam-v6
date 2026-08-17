@@ -23,7 +23,23 @@ PERMISSIONS = [
     ("android.permission.ACCESS_NETWORK_STATE", "فحص حالة الاتصال"),
     # رؤية التطبيقات المثبتة - لكشف برامج الموقع الوهمي على أندرويد 11+
     ("android.permission.QUERY_ALL_PACKAGES", "كشف تطبيقات الموقع الوهمي"),
+    # التحديث الذاتي - فتح مثبّت النظام على ملف APK منزَّل داخل التطبيق
+    ("android.permission.REQUEST_INSTALL_PACKAGES", "تثبيت تحديث التطبيق"),
 ]
+
+# موفّر الملفات: بدونه يرمي أندرويد 7+ استثناء FileUriExposedException
+# عند تمرير مسار ملف إلى مثبّت النظام. السلطة تُشتقّ من اسم الحزمة
+# لتطابق ما يبنيه AndroidBridge.launchInstaller حرفياً.
+FILE_PROVIDER = """        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+"""
 
 
 def main() -> int:
@@ -72,8 +88,33 @@ def main() -> int:
         content, n = pattern.subn(r'\1\n            ' + soft_input, content, count=1)
         soft_input_state = "أضيف" if n else "تعذّر - لم يُعثر على وسم MainActivity"
 
+    # ---- موفّر الملفات للتحديث الذاتي ----
+    if ".fileprovider" in content:
+        provider_state = "موجود"
+    elif "</application>" in content:
+        content = content.replace("</application>", FILE_PROVIDER + "    </application>", 1)
+        provider_state = "أضيف"
+    else:
+        provider_state = "تعذّر - لم يُعثر على وسم application"
+
     if content != original:
         MANIFEST.write_text(content, encoding="utf-8")
+
+    # ---- ملف مسارات الموفّر ----
+    # getExternalFilesDir(null) يقابل external-files-path بمسار "."
+    paths_file = MANIFEST.parent / "res" / "xml" / "file_paths.xml"
+    if paths_file.exists():
+        paths_state = "موجود"
+    else:
+        paths_file.parent.mkdir(parents=True, exist_ok=True)
+        paths_file.write_text(
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<paths>\n'
+            '    <external-files-path name="apk_update" path="." />\n'
+            '</paths>\n',
+            encoding="utf-8"
+        )
+        paths_state = "أُنشئ"
 
     print("=" * 55)
     print("تعديل AndroidManifest.xml")
@@ -84,6 +125,8 @@ def main() -> int:
         print(f"  [موجودة] {p}")
 
     print(f"  [{soft_input_state}] windowSoftInputMode=adjustResize")
+    print(f"  [{provider_state}] FileProvider")
+    print(f"  [{paths_state}] res/xml/file_paths.xml")
 
     # تحقق نهائي
     final = MANIFEST.read_text(encoding="utf-8")
@@ -96,6 +139,14 @@ def main() -> int:
 
     if soft_input not in final:
         print("\n[فشل] لم يُضبط windowSoftInputMode - سيغطّي الكيبورد حقول الكتابة")
+        return 1
+
+    if ".fileprovider" not in final:
+        print("\n[فشل] FileProvider غير موجود - سيفشل تثبيت التحديث الذاتي")
+        return 1
+
+    if not paths_file.exists():
+        print(f"\n[فشل] ملف المسارات غير موجود: {paths_file}")
         return 1
 
     count = len(re.findall(r"<uses-permission", final))
