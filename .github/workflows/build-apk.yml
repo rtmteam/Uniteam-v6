@@ -29,6 +29,11 @@ jobs:
     name: Build signed APK
     runs-on: ubuntu-latest
 
+    # إنشاء الإصدار يحتاج صلاحية كتابة على المحتوى.
+    # بدونها تفشل الخطوة الأخيرة برمز 403 بعد نجاح البناء كله.
+    permissions:
+      contents: write
+
     steps:
       # ================= 1. البيئة =================
       - name: Checkout repository
@@ -268,7 +273,7 @@ jobs:
           echo ""
           echo "===== 3) فحص إلزامي ====="
           FAILED=0
-          for P in ACCESS_FINE_LOCATION ACCESS_COARSE_LOCATION INTERNET QUERY_ALL_PACKAGES; do
+          for P in ACCESS_FINE_LOCATION ACCESS_COARSE_LOCATION INTERNET QUERY_ALL_PACKAGES REQUEST_INSTALL_PACKAGES; do
             if echo "$PERMS" | grep -q "$P"; then
               echo "  [نجاح] $P"
             else
@@ -286,6 +291,27 @@ jobs:
             FAILED=1
           fi
 
+          echo ""
+          echo "===== 5) التحديث الذاتي ====="
+          # بدون FileProvider يرمي أندرويد 7+ استثناءً عند فتح المثبّت،
+          # فيفشل التحديث على كل جهاز بلا رسالة مفهومة.
+          if grep -q "fileprovider" android/app/src/main/AndroidManifest.xml; then
+            echo "  [نجاح] FileProvider مُعلَن"
+          else
+            echo "  [فشل]  FileProvider غير مُعلَن - سيفشل تثبيت التحديث"
+            FAILED=1
+          fi
+          if [ -f android/app/src/main/res/xml/file_paths.xml ]; then
+            echo "  [نجاح] file_paths.xml موجود"
+          else
+            echo "  [فشل]  file_paths.xml غير موجود"
+            FAILED=1
+          fi
+
+          echo ""
+          echo "===== 6) رقم النسخة - ضعه في server-config.json ====="
+          grep -E "versionCode|versionName" android/app/build.gradle
+
           exit $FAILED
 
       # ================= 8. الناتج =================
@@ -302,6 +328,43 @@ jobs:
           path: output/Uniteam-Attendance.apk
           retention-days: 90
           if-no-files-found: error
+
+      # ================= 9. نشر الإصدار تلقائياً =================
+      # الـ Artifact أعلاه لا يصلح رابطاً للموظفين: ينتهي بعد 90 يوماً
+      # ويتطلب تسجيل دخول لجيت هَب. أما ملف الإصدار فرابطه مباشر ودائم.
+      - name: Publish GitHub Release
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          VN="${{ inputs.version_name }}"
+          VC="${{ inputs.version_code }}"
+          [ -z "$VN" ] && VN="1.0"
+          [ -z "$VC" ] && VC="1"
+          TAG="v${VN}"
+
+          # الوسم موجود مسبقاً؟ نرفع الملف فوق الإصدار القائم بدل الفشل.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "الإصدار $TAG موجود - يُستبدل الملف"
+            gh release upload "$TAG" output/Uniteam-Attendance.apk --clobber
+          else
+            gh release create "$TAG" output/Uniteam-Attendance.apk \
+              --title "Uniteam $VN" \
+              --notes "بناء تلقائي.
+
+          رقم الإصدار الداخلي: \`$VC\`
+
+          ضع القيم التالية في \`public/server-config.json\`:
+          \`\`\`json
+          \"latestVersionCode\": $VC,
+          \"latestVersionName\": \"$VN\",
+          \"apkUrl\": \"https://github.com/${{ github.repository }}/releases/download/$TAG/Uniteam-Attendance.apk\"
+          \`\`\`"
+          fi
+
+          echo "APK_URL=https://github.com/${{ github.repository }}/releases/download/$TAG/Uniteam-Attendance.apk" >> "$GITHUB_ENV"
+          echo "REL_TAG=$TAG" >> "$GITHUB_ENV"
 
       # ================= 9. الملخص =================
       - name: Summary
@@ -326,11 +389,27 @@ jobs:
             echo "- كشف وضع المطور من إعدادات النظام"
             echo "- كشف برامج الموقع الوهمي"
             echo ""
-            echo "### مكان التحميل"
+            echo "### الإصدار نُشر تلقائياً"
             echo ""
-            echo "انزل إلى **أسفل هذه الصفحة** وستجد قسم **Artifacts**، وبداخله **Uniteam-Attendance-APK**."
+            echo "الملف مرفوع على الإصدار **${REL_TAG}**، ورابطه المباشر ثابت لا ينتهي:"
             echo ""
-            echo "ما يُحمَّل ملف **ZIP** — فك ضغطه لتجد ملف APK بالداخل."
+            echo "\`${APK_URL}\`"
+            echo ""
+            echo "### الخطوة الوحيدة المتبقية"
+            echo ""
+            echo "افتح \`public/server-config.json\` والصق هذه القيم ثم Commit:"
+            echo ""
+            echo '```json'
+            echo "  \"latestVersionCode\": ${{ inputs.version_code }},"
+            echo "  \"latestVersionName\": \"${{ inputs.version_name }}\","
+            echo "  \"apkUrl\": \"${APK_URL}\","
+            echo '```'
+            echo ""
+            echo "بعد اكتمال نشر Pages يظهر شريط التحديث الأخضر عند الموظفين."
+            echo ""
+            echo "---"
+            echo ""
+            echo "نسخة احتياطية موجودة في قسم **Artifacts** أسفل الصفحة (ZIP، ينتهي بعد ٩٠ يوماً)."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Failure hint

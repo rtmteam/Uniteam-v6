@@ -3,6 +3,12 @@
   "syncUrl": "https://script.google.com/macros/s/AKfycbxJHYQ6H_-XfFFv0f6oJBfa-aQY8Yf5pla1x4w1UslBphFzSLzq-BoPKgtRPCU-IJHKEw/exec",
   "auditLogUrl": "1QFFCTZrr3tvXK1J3YoiZMZ2oO8PlTdIV-5Hrg7f3xXc",
 
+  "latestVersionCode": 0,
+  "latestVersionName": "0",
+  "apkUrl": "",
+  "updateNotes": "التحديث التلقائي",
+  "updateMandatory": false,
+
   "maintenance": false,
   "maintenanceTitle": "التطبيق تحت الصيانة",
   "maintenanceMessage": "يجري تحديث النظام حالياً. سيعود العمل خلال وقت قصير، ولا داعي لإعادة تثبيت التطبيق."

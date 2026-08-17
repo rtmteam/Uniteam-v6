@@ -28,6 +28,16 @@ const App: React.FC = () => {
   const [isOnline, setIsOnline] = useState(navigator.onLine);
   const [activeView, setActiveView] = useState<'main' | 'reports'>('main');
   const [installPrompt, setInstallPrompt] = useState<any>(null);
+
+  // ---------- تحديث التطبيق الأصلي ----------
+  const [apkUpdate, setApkUpdate] = useState<{
+    available: boolean; url: string; versionName: string; notes: string; mandatory: boolean;
+  }>({ available: false, url: '', versionName: '', notes: '', mandatory: false });
+
+  const [updateState, setUpdateState] = useState<{
+    phase: 'idle' | 'downloading' | 'installing' | 'permission' | 'error';
+    percent: number; message: string;
+  }>({ phase: 'idle', percent: 0, message: '' });
   
   // iOS Installation States
   const [isIos, setIsIos] = useState(false);
@@ -262,6 +272,73 @@ const App: React.FC = () => {
     return () => window.removeEventListener('uniteam:maintenance', onMaintenance);
   }, []);
 
+  /**
+   * فحص توفّر تحديث للتطبيق الأصلي.
+   *
+   * يعمل داخل الـAPK وحده — النسخة المتصفحية تُحدَّث تلقائياً بنشر Pages
+   * فلا معنى لعرض زر تحديث فيها.
+   *
+   * المقارنة بـ versionCode لا versionName: الأول عدد صحيح متزايد فالمقارنة
+   * به قاطعة، أما "3.0.9" و"3.0.10" فترتيبهما النصّي مضلّل.
+   */
+  const checkApkUpdate = (data: any) => {
+    const bridge = (window as any).AndroidBridge;
+    if (!bridge || typeof bridge.getAppVersionCode !== 'function') return;
+    if (!data || !data.apkUrl || typeof data.apkUrl !== 'string') return;
+
+    try {
+      const installed = Number(bridge.getAppVersionCode()) || 0;
+      const latest = Number(data.latestVersionCode) || 0;
+      if (latest > installed) {
+        setApkUpdate({
+          available: true,
+          url: data.apkUrl,
+          versionName: data.latestVersionName || '',
+          notes: data.updateNotes || '',
+          mandatory: data.updateMandatory === true
+        });
+      }
+    } catch (e) {
+      console.warn('APK update check failed', e);
+    }
+  };
+
+  /** يبدأ التنزيل والتثبيت، بعد التأكد من إذن تثبيت الحزم */
+  const startApkUpdate = () => {
+    const bridge = (window as any).AndroidBridge;
+    if (!bridge || typeof bridge.downloadAndInstallApk !== 'function') return;
+
+    // أندرويد 8+ يشترط إذناً لكل تطبيق على حدة قبل فتح المثبّت
+    if (typeof bridge.canInstallApk === 'function' && !bridge.canInstallApk()) {
+      setUpdateState({ phase: 'permission', percent: 0, message: '' });
+      if (typeof bridge.openInstallPermissionSettings === 'function') {
+        bridge.openInstallPermissionSettings();
+      }
+      return;
+    }
+
+    setUpdateState({ phase: 'downloading', percent: 0, message: '' });
+    logAction('بدء تحديث التطبيق', `النسخة: ${apkUpdate.versionName}`);
+    bridge.downloadAndInstallApk(apkUpdate.url);
+  };
+
+  // الجسر ينادي هذه الدالة من جافا ليبلّغ الصفحة بتقدّم التنزيل
+  useEffect(() => {
+    (window as any).onApkUpdateState = (state: string, detail: string) => {
+      if (state === 'progress') {
+        setUpdateState({ phase: 'downloading', percent: parseInt(detail) || 0, message: '' });
+      } else if (state === 'installing') {
+        setUpdateState({ phase: 'installing', percent: 100, message: '' });
+      } else if (state === 'error') {
+        setUpdateState({ phase: 'error', percent: 0, message: detail });
+        logAction('فشل تحديث التطبيق', detail);
+      } else if (state === 'start') {
+        setUpdateState({ phase: 'downloading', percent: 0, message: '' });
+      }
+    };
+    return () => { delete (window as any).onApkUpdateState; };
+  }, []);
+
   useEffect(() => {
     const checkForUpdates = async () => {
       if (!navigator.onLine) return;
@@ -277,6 +354,8 @@ const App: React.FC = () => {
             message: (data && data.maintenanceMessage) ||
                      'يجري تحديث النظام حالياً. حاول مرة أخرى بعد قليل.'
           });
+
+          checkApkUpdate(data);
 
           if (data && data.googleSheetLink && data.googleSheetLink.startsWith('http')) {
             const saved = localStorage.getItem('attendance_config');
@@ -498,6 +577,73 @@ const App: React.FC = () => {
           >
             <Download size={16} /> {isIos ? 'تثبيت Uniteam على الآيفون' : 'تثبيت Uniteam على هاتفك'}
           </button>
+        )}
+
+        {/* ===== شريط تحديث التطبيق — داخل الـAPK فقط ===== */}
+        {apkUpdate.available && (
+          <div className="w-full bg-emerald-950/90 border-t border-emerald-500/40 px-4 py-3">
+            <div className="max-w-6xl mx-auto flex flex-wrap items-center justify-between gap-2">
+              <div className="min-w-0">
+                <div className="text-emerald-300 text-xs font-black flex items-center gap-2">
+                  <Download size={15} className="shrink-0" />
+                  <span>
+                    تحديث جديد متاح
+                    {apkUpdate.versionName && ` — نسخة ${apkUpdate.versionName}`}
+                  </span>
+                </div>
+                {apkUpdate.notes && (
+                  <p className="text-[11px] text-emerald-200/70 font-bold mt-1 truncate">
+                    {apkUpdate.notes}
+                  </p>
+                )}
+                {updateState.phase === 'permission' && (
+                  <p className="text-[11px] text-amber-300 font-bold mt-1">
+                    فعّل «السماح بتثبيت التطبيقات» من الشاشة التي فُتحت، ثم اضغط تحديث مجدداً.
+                  </p>
+                )}
+                {updateState.phase === 'error' && (
+                  <p className="text-[11px] text-red-300 font-bold mt-1">{updateState.message}</p>
+                )}
+                {updateState.phase === 'installing' && (
+                  <p className="text-[11px] text-emerald-200 font-bold mt-1">
+                    اكتمل التنزيل — أكمل التثبيت من شاشة النظام.
+                  </p>
+                )}
+              </div>
+
+              <div className="flex items-center gap-2 shrink-0">
+                {updateState.phase === 'downloading' ? (
+                  <div className="flex items-center gap-2 min-w-[130px]">
+                    <div className="flex-1 h-2 rounded-full bg-emerald-950 border border-emerald-800 overflow-hidden">
+                      <div
+                        className="h-full bg-emerald-400 transition-all duration-200"
+                        style={{ width: `${updateState.percent}%` }}
+                      />
+                    </div>
+                    <span className="text-[11px] font-black text-emerald-300" style={{ direction: 'ltr' }}>
+                      {updateState.percent}%
+                    </span>
+                  </div>
+                ) : (
+                  <button
+                    onClick={startApkUpdate}
+                    className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-black px-4 py-2 rounded-xl cursor-pointer transition-all active:scale-95 min-h-[40px]"
+                  >
+                    {updateState.phase === 'error' ? 'إعادة المحاولة' : 'تحديث الآن'}
+                  </button>
+                )}
+
+                {!apkUpdate.mandatory && updateState.phase === 'idle' && (
+                  <button
+                    onClick={() => setApkUpdate(prev => ({ ...prev, available: false }))}
+                    className="text-emerald-400/70 text-[11px] font-bold px-2 py-2 cursor-pointer"
+                  >
+                    لاحقاً
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
         )}
       </header>
 
