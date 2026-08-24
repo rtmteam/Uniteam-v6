@@ -128,22 +128,41 @@ const App: React.FC = () => {
     }
   };
 
-  const syncWithCloud = useCallback(async (url: string, force: boolean = false) => {
-    if (!url || !url.startsWith('http')) return;
+  /**
+   * مزامنة بيانات النظام من جوجل شيت.
+   *
+   * **تُعيد البيانات المجلوبة** (أو null عند أي تعذّر). كانت لا تُعيد شيئاً،
+   * فمن يناديها لا يستطيع استعمال النتيجة فوراً — وحالة React لا تُحدَّث
+   * تزامنياً. شاشة الدخول تحتاج القائمة الطازجة في نفس اللحظة لا في العرض
+   * التالي، وإلا تحقّقت من نسخة قديمة.
+   *
+   * @param timeoutMs مهلة اختيارية. بدونها تعلّق الشبكة الضعيفة — لا المنقطعة —
+   *   الطلبَ بلا نهاية، فيتجمّد زر الدخول أمام الموظف.
+   */
+  const syncWithCloud = useCallback(async (
+    url: string,
+    force: boolean = false,
+    timeoutMs?: number
+  ): Promise<any | null> => {
+    if (!url || !url.startsWith('http')) return null;
     // Don't sync if offline
     if (!navigator.onLine) {
        setSyncError(true);
-       return;
+       return null;
     }
-    
+
     setIsSyncing(true);
     setSyncError(false);
+
+    const controller = timeoutMs ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+
     try {
       // مزامنة الوقت بالخلفية لضمان دقة ساعة التطبيق بالتوقيت المصري وحمايته من التلاعب
       syncTimeWithServer().catch(e => console.warn('Background time sync failed', e));
 
       const fetchUrl = `${url}${url.includes('?') ? '&' : '?'}action=getData&t=${Date.now()}`;
-      const response = await fetch(fetchUrl);
+      const response = await fetch(fetchUrl, controller ? { signal: controller.signal } : undefined);
       if (!response.ok) throw new Error('فشل الاتصال');
       const data = await response.json();
       
@@ -187,10 +206,18 @@ const App: React.FC = () => {
         localStorage.setItem('attendance_config', JSON.stringify(configToSave));
         return updatedConfig;
       });
+
+      return data;
     } catch (err) {
       setSyncError(true);
-      console.warn('Sync attempt failed:', err);
+      if ((err as any)?.name === 'AbortError') {
+        console.warn('Sync timed out after', timeoutMs, 'ms');
+      } else {
+        console.warn('Sync attempt failed:', err);
+      }
+      return null;
     } finally {
+      if (timer) clearTimeout(timer);
       setIsSyncing(false);
     }
   }, []); // No dependencies to avoid infinite loops
@@ -657,6 +684,7 @@ const App: React.FC = () => {
               branches={branches}
               setAdminConfig={handleUpdateConfig}
               logAction={logAction}
+              onSync={syncWithCloud}
               onOpenReports={() => setActiveView('reports')}
             />
           ) : (

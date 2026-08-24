@@ -6,6 +6,17 @@ import { getDeviceFingerprint } from '../utils';
 import { LogoMark } from './Logo';
 import ReportsView from './ReportsView';
 
+/**
+ * مهلة مزامنة ما قبل الدخول.
+ *
+ * ثمانِ ثوانٍ: أطول من أي شبكة معقولة، وأقصر من صبر موظف واقف في الشارع.
+ * عند تجاوزها يُكمل الدخول بالقائمة المحلية بدل أن يتجمّد الزر.
+ */
+const PRE_LOGIN_SYNC_TIMEOUT_MS = 8000;
+
+/** مهلة تأكيد ربط الجهاز — أطول لأنها خطوة تأكيد لا تكرار */
+const DEVICE_LINK_SYNC_TIMEOUT_MS = 15000;
+
 interface LoginProps {
   onLogin: (user: User) => void;
   allUsers: User[];
@@ -14,7 +25,8 @@ interface LoginProps {
   branches: Branch[];
   setAdminConfig: (cfg: Partial<AppConfig>) => void;
   logAction: (action: string, details?: string) => void;
-  onSync?: (url?: string, force?: boolean) => Promise<any>;
+  /** الرابط معامل إلزامي — تمرير undefined كان يُخرج الدالة فوراً بلا أثر */
+  onSync?: (url: string, force?: boolean, timeoutMs?: number) => Promise<any | null>;
   /** يفتح شاشة التقارير كصفحة مستقلة أو داخلية */
   onOpenReports?: () => void;
 }
@@ -147,8 +159,9 @@ export default function Login({
       if (text.includes('Password Reset Successfully')) {
         setRecSuccess('تم تغيير كلمة المرور بنجاح. يمكنك الدخول بها الآن.');
         logAction('نجاح استعادة كلمة المرور', `الموظف: ${recVerifiedName}`);
-        // مزامنة فورية: النسخة المحلية ما زالت تحمل كلمة المرور القديمة
-        await onSync?.(undefined, true);
+        // مزامنة فورية بالرابط الصحيح: النسخة المحلية ما زالت تحمل كلمة
+        // المرور القديمة، فبدونها يفشل الدخول بالجديدة حتى إعادة فتح التطبيق.
+        await onSync?.(adminConfig.syncUrl, true, PRE_LOGIN_SYNC_TIMEOUT_MS);
         setNationalId(recNationalId.trim());
         setTimeout(closeRecovery, 2200);
       } else {
@@ -281,10 +294,12 @@ export default function Login({
     let currentUsersList = allUsers;
     const syncTargetUrl = adminConfig.syncUrl || adminConfig.googleSheetLink;
 
-    // 1. المزامنة المباشرة مع شيت جوجل قبل التحقق من بيانات الدخول بالرقم القومي وكلمة المرور
+    // 1. المزامنة المباشرة مع شيت جوجل قبل التحقق من بيانات الدخول.
+    //    بمهلة: على شبكة ضعيفة — لا منقطعة — كان الطلب يعلّق بلا نهاية
+    //    فيتجمّد زر الدخول. عند انتهاء المهلة نُكمل بالقائمة المحلية.
     if (onSync && syncTargetUrl) {
       try {
-        const syncedData = await onSync(syncTargetUrl, true);
+        const syncedData = await onSync(syncTargetUrl, true, PRE_LOGIN_SYNC_TIMEOUT_MS);
         if (syncedData && Array.isArray(syncedData.users)) {
           currentUsersList = syncedData.users;
         }
@@ -360,8 +375,11 @@ export default function Login({
               });
               
               // CRITICAL: Re-sync from Google Sheets to confirm device ID saved and update global state
+              // مهلة أطول من مزامنة الدخول: هذه خطوة تأكيد لا تكرار، وفشلها
+              // يعني أن الجهاز قد لا يكون رُبط. وعند تجاوزها يسقط التنفيذ
+              // إلى المسار أدناه الذي يُدخل الموظف بالبيانات المحلية.
               if (onSync) {
-                const refreshedData = await onSync(syncTargetUrl, true);
+                const refreshedData = await onSync(syncTargetUrl, true, DEVICE_LINK_SYNC_TIMEOUT_MS);
                 if (refreshedData && Array.isArray(refreshedData.users)) {
                   const refreshedUser = refreshedData.users.find((u: User) => 
                     String(u.nationalId).trim() === String(updatedUser.nationalId).trim()
