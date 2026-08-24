@@ -309,7 +309,7 @@ export default function Login({
     }
 
     if (currentUsersList.length === 0 && syncTargetUrl) {
-      setError('تعذر جلب بيانات الموظفين من شيت جوجل، يرجى التأكد من الاتصال بالإنترنت ومحاولة الدخول مجدداً.');
+      setError('تعذر جلب بيانات الموظفين من السيرفر، يرجى التأكد من الاتصال بالإنترنت ومحاولة الدخول مجدداً.');
       logAction('فشل تسجيل دخول موظف', 'السبب: تعذر جلب بيانات الموظفين');
       setIsLoading(false);
       return;
@@ -409,7 +409,7 @@ export default function Login({
     } else {
       setIsLoading(false);
       logAction('فشل تسجيل دخول موظف', `الرقم القومي: ${nationalId}`);
-      setError('بيانات الدخول غير صحيحة، تأكد من الرقم القومي وكلمة المرور المسجلة بالشيت.');
+      setError('بيانات الدخول غير صحيحة، تأكد من الرقم القومي وكلمة المرور.');
     }
   };
 
