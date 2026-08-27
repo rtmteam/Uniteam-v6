@@ -17,7 +17,16 @@ interface UserDashboardProps {
   visitPlans: VisitPlan[];
 }
 
-const UserDashboard: React.FC<UserDashboardProps> = ({ 
+/**
+ * مهلة إرسال تسجيل الحضور.
+ *
+ * عشرون ثانية: أطول من أي شبكة بيانات معقولة حتى المتقطّعة، وأقصر من أن
+ * يظن الموظف أن التطبيق تعطّل. عند تجاوزها يُلغى الطلب وتظهر رسالة تؤكد
+ * له أن شيئاً لم يُسجَّل، فيعيد المحاولة بلا خوف من ازدواج التسجيل.
+ */
+const ATTENDANCE_TIMEOUT_MS = 20000;
+
+const UserDashboard: React.FC<UserDashboardProps> = ({
   user, 
   branches, 
   records, 
@@ -408,17 +417,30 @@ const UserDashboard: React.FC<UserDashboardProps> = ({
         }
 
         // STRICT Server Check - Ensure Code Exists & Valid
-        const response = await fetch(activeLink, {
-          method: 'POST', 
-          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-          body: JSON.stringify({ 
-            action: 'saveAttendance', 
-            ...newRecord, 
-            nationalId: user.nationalId,
-            serialNumber: user.serialNumber,
-            deviceId: getDeviceFingerprint()
-          })
-        });
+        //
+        // المهلة ليست ترفاً: الشبكة **الضعيفة** — لا المنقطعة — لا تُطلق
+        // خطأً أبداً، فيبقى الطلب معلّقاً وزر التسجيل معطّلاً بلا نهاية،
+        // والموظف واقف في الشارع لا يدري أنجح تسجيله أم لا.
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), ATTENDANCE_TIMEOUT_MS);
+
+        let response: Response;
+        try {
+          response = await fetch(activeLink, {
+            method: 'POST',
+            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+            body: JSON.stringify({
+              action: 'saveAttendance',
+              ...newRecord,
+              nationalId: user.nationalId,
+              serialNumber: user.serialNumber,
+              deviceId: getDeviceFingerprint()
+            }),
+            signal: controller.signal
+          });
+        } finally {
+          clearTimeout(timeoutId);
+        }
 
         // A) Check for 404 (Script Deleted/Wrong URL)
         if (response.status === 404) {
@@ -467,6 +489,10 @@ const UserDashboard: React.FC<UserDashboardProps> = ({
             errorMsg = 'الرابط المسجل لا يؤدي إلى كود النظام. يرجى مراجعة المسؤول.';
         } else if (err.message === "OLD_OR_INVALID_CODE") {
             errorMsg = 'كود السيرفر قديم أو غير متوافق. لن يتم تسجيل الحضور أو الانصراف.';
+        } else if (err.name === "AbortError") {
+            // الرسالة تقول للموظف ما يفعل، وتُطمئنه أن التسجيل لم يُحفظ
+            // فلا يخشى ازدواج التسجيل عند إعادة المحاولة.
+            errorMsg = 'الشبكة بطيئة ولم يكتمل الإرسال خلال ٢٠ ثانية. لم يُسجَّل شيء — انتقل لمكان بتغطية أفضل وحاول مجدداً.';
         } else if (err.message === "Failed to fetch") {
             errorMsg = 'تعذر الوصول للسيرفر. تأكد من اتصال الإنترنت أو صحة الرابط.';
         } else if (err.message) {

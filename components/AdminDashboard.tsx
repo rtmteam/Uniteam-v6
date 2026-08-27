@@ -191,17 +191,42 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({
         payload.visitPlans = visitPlans;
       }
 
-      await fetch(config.syncUrl, {
+      // بلا no-cors عمداً.
+      // كان يعمي الاستجابة فتظهر رسالة النجاح مهما ردّ الخادم — وبعد إضافة
+      // المصادقة على updateSystem صار الرفض ممكناً، فكان المسؤول يرى «تم
+      // بنجاح» ولم يُحفظ شيء. text/plain طلب بسيط لا يستدعي preflight،
+      // وهو نفس ما يفعله مسار تسجيل الحضور الذي يقرأ الردّ بنجاح.
+      const response = await fetch(config.syncUrl, {
         method: 'POST',
-        mode: 'no-cors',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
         body: JSON.stringify(payload)
       });
+
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+      const text = (await response.text()).trim();
+
+      if (text.trim().startsWith('<')) {
+        throw new Error('INVALID_RESPONSE');
+      }
+
+      if (text.startsWith('Error:')) {
+        const reason = text.replace(/^Error:\s*/, '');
+        logAction('فشل الحفظ في السحابة', `رفض الخادم: ${text}`);
+        alert('لم يُحفظ شيء.\n\n' + reason);
+        return;
+      }
+
       logAction('حفظ في السحابة', `تحديث بيانات ${dataType || 'النظام'} في جوجل شيت`);
-      alert("تم إرسال البيانات للسحابة بنجاح!");
-    } catch (err) { 
-      logAction('فشل الحفظ في السحابة', `الخطأ: ${err instanceof Error ? err.message : String(err)}`);
-      alert("حدث خطأ أثناء الاتصال بالسحابة"); 
+      alert('تم حفظ البيانات في السحابة بنجاح.');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logAction('فشل الحفظ في السحابة', `الخطأ: ${msg}`);
+      alert(
+        msg === 'INVALID_RESPONSE'
+          ? 'الرابط المسجل لا يؤدي إلى كود النظام. راجع رابط المزامنة.'
+          : 'تعذّر الاتصال بالسحابة. تأكد من الإنترنت وحاول مجدداً.\n\nلم يُحفظ شيء.'
+      );
     }
     finally { setIsPushing(false); }
   };

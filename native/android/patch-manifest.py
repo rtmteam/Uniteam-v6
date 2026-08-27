@@ -101,20 +101,40 @@ def main() -> int:
         MANIFEST.write_text(content, encoding="utf-8")
 
     # ---- ملف مسارات الموفّر ----
-    # getExternalFilesDir(null) يقابل external-files-path بمسار "."
+    #
+    # Capacitor يوفّر file_paths.xml في قالبه، لكنه يحوي external-path
+    # وcache-path فقط. ودالة downloadAndInstallApk تكتب في
+    # getExternalFilesDir(null) التي يقابلها external-files-path وحده.
+    #
+    # لذا لا يكفي «أنشئ الملف إن غاب»: لو اكتفينا بذلك لتخطّينا ملف
+    # Capacitor القائم، ونجح البناء، ثم رمى FileProvider.getUriForFile
+    # استثناءً على الجهاز ولم يُفتح المثبّت أبداً.
+    # الصحيح: ندمج السطر الناقص في الملف الموجود.
     paths_file = MANIFEST.parent / "res" / "xml" / "file_paths.xml"
-    if paths_file.exists():
-        paths_state = "موجود"
-    else:
+    needed = '<external-files-path name="apk_update" path="." />'
+
+    if not paths_file.exists():
         paths_file.parent.mkdir(parents=True, exist_ok=True)
         paths_file.write_text(
             '<?xml version="1.0" encoding="utf-8"?>\n'
             '<paths>\n'
-            '    <external-files-path name="apk_update" path="." />\n'
+            '    ' + needed + '\n'
             '</paths>\n',
             encoding="utf-8"
         )
         paths_state = "أُنشئ"
+    else:
+        paths_content = paths_file.read_text(encoding="utf-8")
+        if "external-files-path" in paths_content:
+            paths_state = "موجود"
+        elif "</paths>" in paths_content:
+            paths_file.write_text(
+                paths_content.replace("</paths>", "    " + needed + "\n</paths>", 1),
+                encoding="utf-8"
+            )
+            paths_state = "دُمج"
+        else:
+            paths_state = "تعذّر - وسم </paths> غير موجود"
 
     print("=" * 55)
     print("تعديل AndroidManifest.xml")
@@ -147,6 +167,11 @@ def main() -> int:
 
     if not paths_file.exists():
         print(f"\n[فشل] ملف المسارات غير موجود: {paths_file}")
+        return 1
+
+    if "external-files-path" not in paths_file.read_text(encoding="utf-8"):
+        print("\n[فشل] external-files-path غير موجود في file_paths.xml")
+        print("      سينجح البناء ثم يفشل تثبيت التحديث على الجهاز")
         return 1
 
     count = len(re.findall(r"<uses-permission", final))
