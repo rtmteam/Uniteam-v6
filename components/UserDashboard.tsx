@@ -98,6 +98,15 @@ const UserDashboard: React.FC<UserDashboardProps> = ({
   const [liveLocation, setLiveLocation] = useState<{ lat: number, lng: number, accuracy: number, timestamp: number } | null>(null);
   const watchIdRef = useRef<number | null>(null);
 
+  /**
+   * سبب تعذّر تتبّع الموقع في الخلفية.
+   *
+   * كان خطأ watchPosition يُكتب في console وحده، فتبقى liveLocation فارغة
+   * وتعرض إشارة المسافة «تحديد الموقع…» بلا نهاية. والموظف واقف ينتظر رقماً
+   * لن يأتي، ولا يعلم أن الإذن مرفوض إلا إن ضغط زر التسجيل.
+   */
+  const [geoError, setGeoError] = useState<{ label: string; help: string } | null>(null);
+
   const [isVerifying, setIsVerifying] = useState(false);
   const [status, setStatus] = useState<{ type: 'success' | 'error' | 'none', msg: string }>({ type: 'none', msg: '' });
   const [reasonText, setReasonText] = useState('');
@@ -112,11 +121,18 @@ const UserDashboard: React.FC<UserDashboardProps> = ({
 
   // Continuous Location Watching (Hidden Background Process)
   useEffect(() => {
-    if (!navigator.geolocation) return;
+    if (!navigator.geolocation) {
+      setGeoError({
+        label: 'الموقع غير مدعوم',
+        help: 'هذا المتصفح لا يدعم تحديد الموقع. استخدم تطبيق Uniteam من هاتفك.'
+      });
+      return;
+    }
 
     const startWatching = () => {
       watchIdRef.current = navigator.geolocation.watchPosition(
         (pos) => {
+          setGeoError(null);
           setLiveLocation({
             lat: pos.coords.latitude,
             lng: pos.coords.longitude,
@@ -125,8 +141,25 @@ const UserDashboard: React.FC<UserDashboardProps> = ({
           });
         },
         (err) => {
-          // Silent error handling in background
           console.debug("Background GPS Error", err);
+          // نفس تصنيف الأخطاء المستعمل في handleAttendance، ليقرأ الموظف
+          // السبب فور فتح الشاشة بدل أن ينتظر ضغطة الزر
+          if (err && err.code === 1) {
+            setGeoError({
+              label: 'إذن الموقع مرفوض',
+              help: 'افتح إعدادات الهاتف ← التطبيقات ← Uniteam ← الأذونات ← الموقع، واختر "السماح أثناء استخدام التطبيق".'
+            });
+          } else if (err && err.code === 2) {
+            setGeoError({
+              label: 'GPS متوقّف',
+              help: 'فعّل خدمة الموقع (GPS) في الهاتف، وتأكد أنك لست في مكان مغلق تماماً.'
+            });
+          } else {
+            setGeoError({
+              label: 'تعذّر تحديد الموقع',
+              help: 'اخرج لمكان مكشوف قليلاً وانتظر ثوانٍ.'
+            });
+          }
         },
         { enableHighAccuracy: true, timeout: 20000, maximumAge: 5000 }
       );
@@ -295,7 +328,12 @@ const UserDashboard: React.FC<UserDashboardProps> = ({
     // 3. Client-Side Checks
     const branch = branches.find(b => b.id === selectedBranchId);
     if (!branch) {
-      logAction(`فشل تسجيل ${type === 'check-in' ? 'حضور' : 'انصراف'}`, `السبب: لم يتم اختيار فرع | الإحداثيات: ${lat}, ${lng}`);
+      // بلا هذه الرسالة كان الزر يعود عاملاً ولا يظهر شيء إطلاقاً.
+      // يقع حين تتغيّر قائمة الفروع في المزامنة الدورية بينما الفرع
+      // القديم ما زال محدّداً — فيضغط الموظف ولا يحدث شيء.
+      const msg = 'الفرع المختار لم يعد متاحاً. أعد اختياره من القائمة ثم حاول مجدداً.';
+      setStatus({ type: 'error', msg });
+      logAction(`فشل تسجيل ${type === 'check-in' ? 'حضور' : 'انصراف'}`, `السبب: ${msg} | الإحداثيات: ${lat}, ${lng}`);
       setIsVerifying(false);
       return;
     }
@@ -697,6 +735,22 @@ const UserDashboard: React.FC<UserDashboardProps> = ({
                 {/* إشارة المسافة — بسيطة كإشارة «متصل» في الترويسة:
                     نقطة خضراء داخل النطاق، صفراء خارجه، والرقم وحده بلا تفاصيل. */}
                 {(() => {
+                  // خطأ الموقع يسبق كل شيء: يظهر ولو لم يُختر فرع بعد،
+                  // لأنه يمنع التسجيل مهما اختار الموظف.
+                  if (geoError) {
+                    return (
+                      <button
+                        type="button"
+                        onClick={() => setStatus({ type: 'error', msg: geoError.help })}
+                        className="ut-chip ut-chip--bad"
+                        style={{ cursor: 'pointer', minHeight: 24 }}
+                        title={geoError.help}
+                      >
+                        <AlertCircle size={11} /> {geoError.label} — اضغط للتفاصيل
+                      </button>
+                    );
+                  }
+
                   const br = branches.find(b => b.id === selectedBranchId);
                   if (!br) return null;
                   if (!liveLocation) {
@@ -763,7 +817,7 @@ const UserDashboard: React.FC<UserDashboardProps> = ({
         </div>
       </div>
       <div className="bg-slate-800 rounded-3xl p-5 md:p-6 border border-slate-700 shadow-xl text-white">
-        <h3 className="font-black mb-6 border-b border-slate-700 pb-4 flex items-center gap-2 text-blue-400 text-[10px] uppercase tracking-widest">السجل الأخير</h3>
+        <h3 className="font-black mb-6 border-b border-slate-700 pb-4 flex items-center gap-2 text-blue-400 text-sm">السجل الأخير</h3>
         <div className="space-y-4">
           {myRecords.length === 0 ? (
             <div className="text-center py-10">
@@ -774,10 +828,14 @@ const UserDashboard: React.FC<UserDashboardProps> = ({
           ) : (
             myRecords.map(r => (
               <div key={r.id} className="p-4 bg-slate-900 rounded-2xl border border-slate-700/50 group hover:border-blue-500 transition-all text-right">
-                <div className="flex justify-between font-black text-[10px] mb-1 uppercase tracking-tighter"><span className="text-slate-300">{r.branchName}</span><span className={r.type === 'check-in' ? 'text-green-400' : 'text-orange-400'}>{r.type === 'check-in' ? 'حضور' : 'انصراف'}</span></div>
-                <div className="text-[9px] text-slate-500 font-bold mb-1">{new Date(r.timestamp).toLocaleTimeString('en-US')}</div>
-                <div className="text-[8px] text-blue-400 font-black mb-1 italic uppercase">{r.timeDiff}</div>
-                {r.reason && (<div className="text-[8px] text-slate-400 font-bold bg-slate-800 p-2 rounded-lg border border-slate-700">السبب: {r.reason}</div>)}
+                {/* الأحجام كانت 8–10px: غير مقروءة على هاتف تحت شمس الإسكندرية.
+                    الحد الأدنى الآن 12px للثانوي و14px للسطر الرئيسي.
+                    حُذفت uppercase وitalic — لا أثر لهما في العربية، والمائل
+                    يُصطنع اصطناعاً فيشوّه اتصال الحروف. */}
+                <div className="flex justify-between font-black text-sm mb-1.5"><span className="text-slate-300">{r.branchName}</span><span className={r.type === 'check-in' ? 'text-green-400' : 'text-orange-400'}>{r.type === 'check-in' ? 'حضور' : 'انصراف'}</span></div>
+                <div className="text-xs text-slate-500 font-bold mb-1" style={{ direction: 'ltr', textAlign: 'right' }}>{new Date(r.timestamp).toLocaleTimeString('en-US')}</div>
+                <div className="text-xs text-blue-400 font-black mb-1.5">{r.timeDiff}</div>
+                {r.reason && (<div className="text-xs text-slate-400 font-bold bg-slate-800 p-2.5 rounded-lg border border-slate-700 leading-relaxed">السبب: {r.reason}</div>)}
               </div>
             ))
           )}

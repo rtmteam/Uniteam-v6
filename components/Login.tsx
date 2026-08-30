@@ -17,6 +17,61 @@ const PRE_LOGIN_SYNC_TIMEOUT_MS = 8000;
 /** مهلة تأكيد ربط الجهاز — أطول لأنها خطوة تأكيد لا تكرار */
 const DEVICE_LINK_SYNC_TIMEOUT_MS = 15000;
 
+/** مهلة الكتابة على الخادم — نفس مهلة تسجيل الحضور */
+const WRITE_TIMEOUT_MS = 20000;
+
+/**
+ * إرسال أمر كتابة للخادم وقراءة ردّه فعلاً.
+ *
+ * كان التسجيل وربط الجهاز يستعملان `mode: 'no-cors'`، وهو يُعمي الاستجابة
+ * تماماً: الطلب "ينجح" مهما ردّ الخادم — بل ومهما رفض. فكان الموظف يُدخَل
+ * للتطبيق وحسابه لم يصل الشيت، أو جهازه لم يُربط، وهو لا يدري.
+ *
+ * `text/plain` طلب بسيط لا يستدعي preflight، وهو نفس ما يفعله مسار تسجيل
+ * الحضور الذي يقرأ ردّ الخادم بنجاح منذ البداية.
+ *
+ * @returns نصّ الردّ بعد التشذيب
+ * @throws  Error برسالة مصنّفة: SERVER_404 · INVALID_RESPONSE · AbortError
+ */
+const postToServer = async (url: string, payload: any): Promise<string> => {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), WRITE_TIMEOUT_MS);
+
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify(payload),
+      signal: controller.signal
+    });
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  if (response.status === 404) throw new Error('SERVER_404');
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+  const text = (await response.text()).trim();
+  // صفحة تسجيل دخول جوجل أو صفحة خطأ HTML بدل ردّ الكود
+  if (!text || text.startsWith('<')) throw new Error('INVALID_RESPONSE');
+  return text;
+};
+
+/** رسالة عربية موحّدة لأخطاء الاتصال بالخادم */
+const describeServerError = (err: any): string => {
+  if (err?.name === 'AbortError') {
+    return 'الشبكة بطيئة ولم يكتمل الإرسال خلال ٢٠ ثانية. لم يُحفظ شيء — انتقل لمكان بتغطية أفضل وحاول مجدداً.';
+  }
+  if (err?.message === 'SERVER_404') {
+    return 'رابط الشركة غير صحيح أو تم حذفه من السيرفر (404). راجع المسؤول.';
+  }
+  if (err?.message === 'INVALID_RESPONSE') {
+    return 'الرابط المسجل لا يؤدي إلى كود النظام. راجع المسؤول.';
+  }
+  return 'تعذّر الاتصال بالخادم. تأكد من الإنترنت وحاول مجدداً.';
+};
+
 interface LoginProps {
   onLogin: (user: User) => void;
   allUsers: User[];
@@ -257,26 +312,69 @@ export default function Login({
       registrationDate: new Date().toISOString()
     };
 
-    if (adminConfig.googleSheetLink) {
+    // بلا رابط سحابة لا وجود لحساب أصلاً — الدخول محلياً يوهم الموظف
+    // بأنه سجّل، ثم يكتشف بعد أيام أن اسمه ليس في النظام.
+    if (!adminConfig.googleSheetLink) {
+      setIsLoading(false);
+      setError('التطبيق غير مربوط بالسحابة، ولا يمكن إنشاء حساب الآن. راجع المسؤول.');
+      logAction('فشل تسجيل مستخدم جديد', 'السبب: التطبيق غير مربوط بالسحابة');
+      return;
+    }
+
+    let serverReply = '';
+    try {
+      serverReply = await postToServer(adminConfig.googleSheetLink, {
+        action: 'registerUser',
+        ...newUser,
+        timestamp: newUser.registrationDate
+      });
+    } catch (err: any) {
+      setIsLoading(false);
+      const msg = describeServerError(err);
+      setError('لم يُنشأ الحساب. ' + msg);
+      logAction('فشل تسجيل مستخدم جديد', `السبب: ${msg} | ${err?.message || ''}`);
+      return;
+    }
+
+    // الخادم يردّ "User Registered Successfully" عند النجاح وحده.
+    // التحقق بوجود نصّ النجاح لا بغياب كلمة خطأ — فبعض ردود الرفض
+    // تأتي بلا بادئة Error (مثل "User Not Found" في إجراءات أخرى).
+    if (!serverReply.includes('User Registered Successfully')) {
+      setIsLoading(false);
+      const reason = serverReply.replace(/^Error:\s*/, '');
+      setError(
+        serverReply.includes('National ID Already Registered')
+          ? 'هذا الرقم القومي مسجل مسبقاً في النظام. جرّب الدخول بدل إنشاء حساب.'
+          : 'لم يُنشأ الحساب: ' + reason
+      );
+      logAction('فشل تسجيل مستخدم جديد', `رفض الخادم: ${serverReply}`);
+      return;
+    }
+
+    logAction('تسجيل مستخدم جديد', `الموظف: ${fullName}, الوظيفة: ${selectedJob}`);
+
+    // الخادم يولّد الرقم التسلسلي بنفسه ولا يُعيده في الردّ، فالنسخة
+    // المحلية تخرج بلا serialNumber — يظهر «SN: ---» ويُرسل فارغاً مع أول
+    // تسجيل حضور. المزامنة هنا تجلب النسخة الكاملة من الشيت.
+    let userToLogin: User = newUser;
+    if (onSync) {
       try {
-        await fetch(adminConfig.googleSheetLink, {
-          method: 'POST',
-          mode: 'no-cors',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ 
-            action: 'registerUser',
-            ...newUser,
-            timestamp: newUser.registrationDate
-          })
-        });
+        const synced = await onSync(adminConfig.googleSheetLink, true, PRE_LOGIN_SYNC_TIMEOUT_MS);
+        if (synced && Array.isArray(synced.users)) {
+          const fresh = synced.users.find(
+            (u: User) => String(u.nationalId).trim() === String(newUser.nationalId).trim()
+          );
+          if (fresh) userToLogin = fresh;
+        }
       } catch (err) {
-        console.error("Cloud registration failed", err);
+        // الحساب حُفظ فعلاً — فشل المزامنة لا يمنع الدخول،
+        // والمزامنة الدورية ستُكمل الرقم التسلسلي خلال دقائق.
+        console.warn('Post-registration sync notice:', err);
       }
     }
 
     setIsLoading(false);
-    logAction('تسجيل مستخدم جديد', `الموظف: ${fullName}, الوظيفة: ${selectedJob}`);
-    onLogin(newUser);
+    onLogin(userToLogin);
   };
 
   const handleEmployeeLogin = async (e: React.FormEvent) => {
@@ -360,45 +458,67 @@ export default function Login({
             deviceId: currentDeviceId
           };
           
-          if (syncTargetUrl) {
+          // ربط الجهاز يجب أن يُثبت على الخادم قبل الدخول.
+          // كان الفشل يُبتلع ثم يُسجَّل «ربط جهاز جديد» في سجلّ التدقيق
+          // ويُدخل الموظف — فيناقض السجلُّ الشيتَ، ويظنّ الموظف أن جهازه
+          // مربوط بينما حصّته من الأجهزة لم تُستهلك أصلاً على الخادم.
+          if (!syncTargetUrl) {
+            setIsLoading(false);
+            setError('التطبيق غير مربوط بالسحابة، ولا يمكن ربط هذا الجهاز الآن. راجع المسؤول.');
+            logAction('فشل ربط جهاز جديد', `الموظف: ${user.fullName}, السبب: لا يوجد رابط سحابة`);
+            return;
+          }
+
+          let deviceReply = '';
+          try {
+            deviceReply = await postToServer(syncTargetUrl, {
+              action: 'updateUserDevice',
+              nationalId: updatedUser.nationalId,
+              userId: updatedUser.id,
+              deviceIds: updatedDevices
+            });
+          } catch (err: any) {
+            setIsLoading(false);
+            const msg = describeServerError(err);
+            setError('لم يُربط هذا الجهاز بحسابك. ' + msg);
+            logAction('فشل ربط جهاز جديد', `الموظف: ${user.fullName}, الجهاز: ${currentDeviceId} | ${msg}`);
+            return;
+          }
+
+          // الخادم يردّ "Device Updated" عند النجاح وحده.
+          // انتبه: ردّ الرفض "User Not Found" يأتي بلا بادئة Error،
+          // فلا يصحّ التحقق بغياب كلمة خطأ.
+          if (!deviceReply.includes('Device Updated')) {
+            setIsLoading(false);
+            setError(
+              deviceReply.includes('User Not Found')
+                ? 'لم يُعثر على حسابك في السجلّ السحابي. راجع المسؤول.'
+                : 'لم يُربط هذا الجهاز بحسابك: ' + deviceReply.replace(/^Error:\s*/, '')
+            );
+            logAction('فشل ربط جهاز جديد', `الموظف: ${user.fullName}, رفض الخادم: ${deviceReply}`);
+            return;
+          }
+
+          // الربط تأكّد على الخادم. المزامنة بعده تحديثٌ للحالة لا شرطٌ
+          // للدخول، ففشلها على شبكة ضعيفة لا يبرّر منع موظف رُبط جهازه فعلاً.
+          let userToLogin: User = updatedUser;
+          if (onSync) {
             try {
-              await fetch(syncTargetUrl, {
-                method: 'POST',
-                mode: 'no-cors',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ 
-                  action: 'updateUserDevice',
-                  nationalId: updatedUser.nationalId,
-                  userId: updatedUser.id,
-                  deviceIds: updatedDevices
-                })
-              });
-              
-              // CRITICAL: Re-sync from Google Sheets to confirm device ID saved and update global state
-              // مهلة أطول من مزامنة الدخول: هذه خطوة تأكيد لا تكرار، وفشلها
-              // يعني أن الجهاز قد لا يكون رُبط. وعند تجاوزها يسقط التنفيذ
-              // إلى المسار أدناه الذي يُدخل الموظف بالبيانات المحلية.
-              if (onSync) {
-                const refreshedData = await onSync(syncTargetUrl, true, DEVICE_LINK_SYNC_TIMEOUT_MS);
-                if (refreshedData && Array.isArray(refreshedData.users)) {
-                  const refreshedUser = refreshedData.users.find((u: User) => 
-                    String(u.nationalId).trim() === String(updatedUser.nationalId).trim()
-                  );
-                  if (refreshedUser) {
-                    setIsLoading(false);
-                    logAction('تسجيل دخول موظف (ربط جهاز جديد)', `الموظف: ${refreshedUser.fullName}, الجهاز: ${currentDeviceId}`);
-                    onLogin(refreshedUser);
-                    return;
-                  }
-                }
+              const refreshedData = await onSync(syncTargetUrl, true, DEVICE_LINK_SYNC_TIMEOUT_MS);
+              if (refreshedData && Array.isArray(refreshedData.users)) {
+                const refreshedUser = refreshedData.users.find((u: User) =>
+                  String(u.nationalId).trim() === String(updatedUser.nationalId).trim()
+                );
+                if (refreshedUser) userToLogin = refreshedUser;
               }
             } catch (err) {
-              console.error("Sync device update failed", err);
+              console.warn('Post device-link sync notice:', err);
             }
           }
+
           setIsLoading(false);
-          logAction('تسجيل دخول موظف (ربط جهاز جديد)', `الموظف: ${updatedUser.fullName}, الجهاز: ${currentDeviceId}`);
-          onLogin(updatedUser);
+          logAction('تسجيل دخول موظف (ربط جهاز جديد)', `الموظف: ${userToLogin.fullName}, الجهاز: ${currentDeviceId}`);
+          onLogin(userToLogin);
         } else {
           // Limit reached
           setIsLoading(false);
@@ -716,7 +836,8 @@ export default function Login({
                       <AlertCircle size={15} className="shrink-0 mt-0.5" /><span>{recError}</span>
                     </div>
                   )}
-                  <button type="submit" disabled={recLoading} className="w-full bg-emerald-600 text-white font-black py-3 rounded-2xl flex items-center justify-center gap-2 text-xs">
+                  {/* emerald-700: الأبيض على 600 يعطي 3.77:1 دون حدّ WCAG */}
+                  <button type="submit" disabled={recLoading} className="w-full bg-emerald-700 text-white font-black py-3 rounded-2xl flex items-center justify-center gap-2 text-xs">
                     {recLoading ? <Loader2 className="animate-spin" size={17} /> : <KeyRound size={17} />}
                     {recLoading ? 'جارٍ الحفظ…' : 'تعيين كلمة المرور'}
                   </button>

@@ -88,10 +88,12 @@ const App: React.FC = () => {
 
   useEffect(() => {
     // Android Install Prompt
-    window.addEventListener('beforeinstallprompt', (e) => {
+    // المستمع مُسمّى ليُزال في التنظيف — كان يُضاف مجهولاً ويبقى معلّقاً
+    const handleInstallPrompt = (e: Event) => {
       e.preventDefault();
       setInstallPrompt(e);
-    });
+    };
+    window.addEventListener('beforeinstallprompt', handleInstallPrompt);
 
     // Detect iOS
     const userAgent = window.navigator.userAgent.toLowerCase();
@@ -110,6 +112,7 @@ const App: React.FC = () => {
     window.addEventListener('offline', handleOffline);
 
     return () => {
+      window.removeEventListener('beforeinstallprompt', handleInstallPrompt);
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
     };
@@ -273,12 +276,14 @@ const App: React.FC = () => {
        syncWithCloud(config.syncUrl);
      }
 
-     // 2. Poll every 2 seconds to keep data fresh if online (for non-admin users)
+     // 2. مزامنة دورية كل خمس دقائق ما دام الاتصال قائماً (لغير المسؤول).
+     //    خمس دقائق لا ثوانٍ: الخادم Google Apps Script له حصص استدعاء
+     //    محدودة، و٤٨ موظفاً يستدعون كل ثانيتين يستنفدونها سريعاً.
      const intervalId = setInterval(() => {
        if (navigator.onLine) {
          syncWithCloud(config.syncUrl);
        }
-     }, 300000); // 2 seconds interval
+     }, 300000);
 
      return () => clearInterval(intervalId);
   }, [isOnline, config.syncUrl, syncWithCloud, currentUser]);
@@ -652,9 +657,12 @@ const App: React.FC = () => {
                     </span>
                   </div>
                 ) : (
+                  // emerald-700 لا 600: الأبيض على #059669 يعطي 3.77:1 وهو
+                  // دون حدّ WCAG (4.5:1)، ويختفي عملياً تحت شمس الإسكندرية.
+                  // #047857 يرفعه إلى 5.48:1.
                   <button
                     onClick={startApkUpdate}
-                    className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-black px-4 py-2 rounded-xl cursor-pointer transition-all active:scale-95 min-h-[40px]"
+                    className="bg-emerald-700 hover:bg-emerald-600 text-white text-xs font-black px-4 py-2 rounded-xl cursor-pointer transition-all active:scale-95 min-h-[40px]"
                   >
                     {updateState.phase === 'error' ? 'إعادة المحاولة' : 'تحديث الآن'}
                   </button>
@@ -762,7 +770,8 @@ const App: React.FC = () => {
             <div className="absolute -bottom-2 left-1/2 -translate-x-1/2 translate-y-full text-white animate-bounce md:hidden">
               <div className="flex flex-col items-center gap-2 mt-4">
                  <span className="text-[10px] font-black">اضغط هنا</span>
-                 <svg width="24" height="24" viewBox="0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 5v14M19 12l-7 7-7-7"/></svg>
+                 {/* viewBox كانت "0 24 24" — ثلاث قيم بدل أربع، فلا يُرسم السهم */}
+                 <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 5v14M19 12l-7 7-7-7"/></svg>
               </div>
             </div>
           </div>
@@ -788,9 +797,13 @@ const App: React.FC = () => {
             <p>3. قم بـ **إيقاف/تعطيل** خيارات المطور (Developer Options Off).</p>
             <p>4. عد لتطبيق Uniteam واضغط إعادة الفحص بالأسفل.</p>
           </div>
-          <button 
+          {/* التدرّج مكتوب هنا لا عبر bg-red-600: skin.css يفرض على
+              button.bg-red-600 تدرّجاً يبدأ بـ #EF4444 بـ !important، والأبيض
+              عليه 3.50:1 — دون الحدّ. هذا التدرّج أدكن: 4.83:1 إلى 6.42:1. */}
+          <button
             onClick={() => setDeveloperModeStatus(checkDeveloperOptionsStatus())}
-            className="bg-red-600 hover:bg-red-500 text-white font-black px-5 md:px-8 py-3.5 rounded-2xl text-sm shadow-xl transition-all cursor-pointer flex items-center gap-2"
+            className="text-white font-black px-5 md:px-8 py-3.5 rounded-2xl text-sm shadow-xl transition-all cursor-pointer flex items-center gap-2"
+            style={{ backgroundImage: 'linear-gradient(135deg, #DC2626 0%, #B91C1C 100%)' }}
           >
             <RefreshCw size={18} />
             إعادة الفحص الآن
