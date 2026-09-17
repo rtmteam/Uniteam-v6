@@ -20,11 +20,18 @@ interface UserDashboardProps {
 /**
  * مهلة إرسال تسجيل الحضور.
  *
- * عشرون ثانية: أطول من أي شبكة بيانات معقولة حتى المتقطّعة، وأقصر من أن
- * يظن الموظف أن التطبيق تعطّل. عند تجاوزها يُلغى الطلب وتظهر رسالة تؤكد
- * له أن شيئاً لم يُسجَّل، فيعيد المحاولة بلا خوف من ازدواج التسجيل.
+ * خمس وأربعون ثانية: الخادم ينتظر قفل الكتابة حتى ١٥ ثانية ثم يقرأ ثلاثة
+ * شيتات ويكتب، وفي ذروة الصباح يتجاوز ذلك ٢٠ ثانية. كانت المهلة ٢٠ ثانية
+ * فيُلغى الطلب بينما الخادم يُكمل الكتابة، وتظهر للموظف رسالة تؤكد كذباً
+ * أن شيئاً لم يُسجَّل، فيعيد المحاولة ويتكرر الصف في الشيت.
+ *
+ * عند تجاوزها تُعاد المحاولة تلقائياً مرة واحدة؛ والخادم يتجاهل أي تسجيل
+ * مكرّر لنفس الموظف ونفس النوع خلال عشر دقائق، فالإعادة آمنة.
  */
-const ATTENDANCE_TIMEOUT_MS = 20000;
+const ATTENDANCE_TIMEOUT_MS = 45000;
+
+/** عدد المحاولات الإضافية التلقائية بعد انتهاء المهلة */
+const ATTENDANCE_AUTO_RETRIES = 1;
 
 const UserDashboard: React.FC<UserDashboardProps> = ({
   user, 
@@ -108,7 +115,15 @@ const UserDashboard: React.FC<UserDashboardProps> = ({
   const [geoError, setGeoError] = useState<{ label: string; help: string } | null>(null);
 
   const [isVerifying, setIsVerifying] = useState(false);
-  const [status, setStatus] = useState<{ type: 'success' | 'error' | 'none', msg: string }>({ type: 'none', msg: '' });
+  const [status, setStatus] = useState<{ type: 'success' | 'error' | 'info' | 'none', msg: string }>({ type: 'none', msg: '' });
+
+  // ثوانٍ الانتظار منذ الضغط — تُعرض داخل الزر ليعلم الموظف أن الطلب ما زال يعمل
+  const [waitSeconds, setWaitSeconds] = useState(0);
+  useEffect(() => {
+    if (!isVerifying) { setWaitSeconds(0); return; }
+    const t = setInterval(() => setWaitSeconds(s => s + 1), 1000);
+    return () => clearInterval(t);
+  }, [isVerifying]);
   const [reasonText, setReasonText] = useState('');
 
   const [currentTime, setCurrentTime] = useState(getEgyptTime());
@@ -459,25 +474,44 @@ const UserDashboard: React.FC<UserDashboardProps> = ({
         // المهلة ليست ترفاً: الشبكة **الضعيفة** — لا المنقطعة — لا تُطلق
         // خطأً أبداً، فيبقى الطلب معلّقاً وزر التسجيل معطّلاً بلا نهاية،
         // والموظف واقف في الشارع لا يدري أنجح تسجيله أم لا.
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), ATTENDANCE_TIMEOUT_MS);
+        const payload = JSON.stringify({
+          action: 'saveAttendance',
+          ...newRecord,
+          nationalId: user.nationalId,
+          serialNumber: user.serialNumber,
+          deviceId: getDeviceFingerprint()
+        });
 
+        const postOnce = async (): Promise<Response> => {
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), ATTENDANCE_TIMEOUT_MS);
+          try {
+            return await fetch(activeLink, {
+              method: 'POST',
+              headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+              body: payload,
+              signal: controller.signal
+            });
+          } finally {
+            clearTimeout(timeoutId);
+          }
+        };
+
+        // إعادة المحاولة التلقائية بعد انتهاء المهلة.
+        // آمنة لأن الخادم يردّ «مسجَّل» على أي تكرار خلال عشر دقائق دون صف جديد.
         let response: Response;
-        try {
-          response = await fetch(activeLink, {
-            method: 'POST',
-            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-            body: JSON.stringify({
-              action: 'saveAttendance',
-              ...newRecord,
-              nationalId: user.nationalId,
-              serialNumber: user.serialNumber,
-              deviceId: getDeviceFingerprint()
-            }),
-            signal: controller.signal
-          });
-        } finally {
-          clearTimeout(timeoutId);
+        let attempt = 0;
+        while (true) {
+          try {
+            response = await postOnce();
+            break;
+          } catch (e: any) {
+            if (e?.name !== 'AbortError' || attempt >= ATTENDANCE_AUTO_RETRIES) throw e;
+            attempt++;
+            setWaitSeconds(0);
+            setStatus({ type: 'info', msg: 'لم يصل تأكيد الخادم بعد. جارٍ إعادة المحاولة تلقائياً — لا تغلق التطبيق.' });
+            logAction(`انتهت مهلة تسجيل ${type === 'check-in' ? 'حضور' : 'انصراف'} بلا تأكيد`, `إعادة محاولة تلقائية رقم ${attempt} | الإحداثيات: ${lat}, ${lng}`);
+          }
         }
 
         // A) Check for 404 (Script Deleted/Wrong URL)
@@ -528,16 +562,19 @@ const UserDashboard: React.FC<UserDashboardProps> = ({
         } else if (err.message === "OLD_OR_INVALID_CODE") {
             errorMsg = 'كود السيرفر قديم أو غير متوافق. لن يتم تسجيل الحضور أو الانصراف.';
         } else if (err.name === "AbortError") {
-            // الرسالة تقول للموظف ما يفعل، وتُطمئنه أن التسجيل لم يُحفظ
-            // فلا يخشى ازدواج التسجيل عند إعادة المحاولة.
-            errorMsg = 'الشبكة بطيئة ولم يكتمل الإرسال خلال ٢٠ ثانية. لم يُسجَّل شيء — انتقل لمكان بتغطية أفضل وحاول مجدداً.';
+            // لا نزعم أن شيئاً لم يُسجَّل — الخادم قد يكون أكمل الكتابة بعد
+            // الإلغاء. الإعادة آمنة لأن الخادم يتجاهل التكرار خلال عشر دقائق.
+            errorMsg = 'لم يصل تأكيد من الخادم بعد محاولتين. قد يكون تسجيلك وصل فعلاً — عند تحسّن الشبكة اضغط الزر مرة أخرى بأمان، فلن يتكرر التسجيل.';
         } else if (err.message === "Failed to fetch") {
             errorMsg = 'تعذر الوصول للسيرفر. تأكد من اتصال الإنترنت أو صحة الرابط.';
         } else if (err.message) {
             errorMsg = `خطأ: ${err.message}`;
         }
 
-        logAction(`فشل تسجيل ${type === 'check-in' ? 'حضور' : 'انصراف'}`, `السبب: ${errorMsg}${err.message ? ' | تفاصيل: ' + err.message : ''} | الإحداثيات: ${lat}, ${lng}`);
+        const auditTitle = err.name === "AbortError"
+          ? `انتهت مهلة تسجيل ${type === 'check-in' ? 'حضور' : 'انصراف'} بلا تأكيد (قد يكون سُجّل)`
+          : `فشل تسجيل ${type === 'check-in' ? 'حضور' : 'انصراف'}`;
+        logAction(auditTitle, `السبب: ${errorMsg}${err.message ? ' | تفاصيل: ' + err.message : ''} | الإحداثيات: ${lat}, ${lng}`);
         setStatus({ type: 'error', msg: errorMsg });
     } finally {
         setIsVerifying(false);
@@ -791,7 +828,7 @@ const UserDashboard: React.FC<UserDashboardProps> = ({
               <textarea value={reasonText} onChange={e => setReasonText(e.target.value)} placeholder="اكتب السبب هنا في حال وجود تأخير أو انصراف مبكر..." className="w-full bg-slate-900 border border-slate-700 text-white px-4 py-3 rounded-2xl font-bold outline-none focus:border-blue-500 transition-all text-right h-24 resize-none shadow-inner text-sm leading-relaxed placeholder:text-slate-500" />
             </div>
             
-            {status.type !== 'none' && (<div className={`p-4 rounded-2xl text-sm font-bold border flex items-center gap-3 ${status.type === 'success' ? 'bg-green-900/20 text-green-400 border-green-800/50' : 'bg-red-900/20 text-red-400 border-red-800/50'}`}>{status.type === 'error' ? <AlertCircle size={20} className="shrink-0" /> : <CheckCircle size={20} className="shrink-0" />}<span className="leading-relaxed">{status.msg}</span></div>)}
+            {status.type !== 'none' && (<div className={`p-4 rounded-2xl text-sm font-bold border flex items-center gap-3 ${status.type === 'success' ? 'bg-green-900/20 text-green-400 border-green-800/50' : status.type === 'info' ? 'bg-blue-900/20 text-blue-300 border-blue-800/50' : 'bg-red-900/20 text-red-400 border-red-800/50'}`}>{status.type === 'error' ? <AlertCircle size={20} className="shrink-0" /> : status.type === 'info' ? <Cloud size={20} className="shrink-0 animate-pulse" /> : <CheckCircle size={20} className="shrink-0" />}<span className="leading-relaxed">{status.msg}</span></div>)}
             
             <div className="grid grid-cols-2 gap-4">
               <button
@@ -801,7 +838,7 @@ const UserDashboard: React.FC<UserDashboardProps> = ({
                 style={{ backgroundImage: 'var(--grad-ok)', boxShadow: '0 8px 26px rgba(16,185,129,.38)' }}
               >
                 <span className="flex items-center gap-2"><CheckCircle size={22} /> حضور</span>
-                {isVerifying && <span className="text-[11px] font-medium animate-pulse">جارٍ التحقق مع السيرفر…</span>}
+                {isVerifying && <span className="text-xs font-medium animate-pulse">جارٍ التحقق مع السيرفر… {waitSeconds} ث</span>}
               </button>
               <button
                 disabled={isVerifying}
@@ -810,7 +847,7 @@ const UserDashboard: React.FC<UserDashboardProps> = ({
                 style={{ backgroundImage: 'var(--grad-warn)', boxShadow: '0 8px 26px rgba(245,158,11,.35)' }}
               >
                 <span className="flex items-center gap-2"><RotateCcw size={22} /> انصراف</span>
-                {isVerifying && <span className="text-[11px] font-medium animate-pulse">جارٍ التحقق مع السيرفر…</span>}
+                {isVerifying && <span className="text-xs font-medium animate-pulse">جارٍ التحقق مع السيرفر… {waitSeconds} ث</span>}
               </button>
             </div>
           </div>
