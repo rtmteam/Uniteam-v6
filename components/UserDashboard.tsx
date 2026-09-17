@@ -497,26 +497,35 @@ const UserDashboard: React.FC<UserDashboardProps> = ({
           }
         };
 
-        // إعادة المحاولة التلقائية بعد انتهاء المهلة.
+        // إعادة المحاولة التلقائية بعد انتهاء المهلة أو ردّ مؤقت غير مكتمل.
         // آمنة لأن الخادم يردّ «مسجَّل» على أي تكرار خلال عشر دقائق دون صف جديد.
+        //
+        // 404 ليس دليلاً على حذف الرابط: خادم Apps Script يعيد التوجيه إلى
+        // صفحة وسيطة (script.googleusercontent.com) تحمل الردّ، وعند الضغط
+        // تعيد جوجل 404 على هذه الصفحة رغم أن الكود نُفّذ وكتب الصف.
+        // فتُعامَل 404 و5xx مثل انتهاء المهلة: إعادة، ثم رسالة صادقة.
+        const isTransientStatus = (st: number) => st === 404 || st >= 500;
         let response: Response;
         let attempt = 0;
         while (true) {
           try {
             response = await postOnce();
+            if (isTransientStatus(response.status)) {
+              const transient: any = new Error(`TRANSIENT_${response.status}`);
+              transient.name = 'TransientServerError';
+              transient.status = response.status;
+              throw transient;
+            }
             break;
           } catch (e: any) {
-            if (e?.name !== 'AbortError' || attempt >= ATTENDANCE_AUTO_RETRIES) throw e;
+            const retryable = e?.name === 'AbortError' || e?.name === 'TransientServerError';
+            if (!retryable || attempt >= ATTENDANCE_AUTO_RETRIES) throw e;
             attempt++;
             setWaitSeconds(0);
             setStatus({ type: 'info', msg: 'لم يصل تأكيد الخادم بعد. جارٍ إعادة المحاولة تلقائياً — لا تغلق التطبيق.' });
-            logAction(`انتهت مهلة تسجيل ${type === 'check-in' ? 'حضور' : 'انصراف'} بلا تأكيد`, `إعادة محاولة تلقائية رقم ${attempt} | الإحداثيات: ${lat}, ${lng}`);
+            const why = e?.name === 'AbortError' ? 'انتهت المهلة' : `ردّ مؤقت ${e.status}`;
+            logAction(`تسجيل ${type === 'check-in' ? 'حضور' : 'انصراف'} بلا تأكيد (${why})`, `إعادة محاولة تلقائية رقم ${attempt} | الإحداثيات: ${lat}, ${lng}`);
           }
-        }
-
-        // A) Check for 404 (Script Deleted/Wrong URL)
-        if (response.status === 404) {
-           throw new Error("SERVER_404");
         }
 
         if (!response.ok) {
@@ -555,8 +564,8 @@ const UserDashboard: React.FC<UserDashboardProps> = ({
         
         if (err.message === "NO_LINK") {
             errorMsg = 'التطبيق غير مربوط بالسحابة - يرجى تحديث الصفحة أو مراجعة الإدارة.';
-        } else if (err.message === "SERVER_404") {
-            errorMsg = 'رابط الشركة غير صحيح أو تم حذفه من السيرفر (404).';
+        } else if (err.name === "TransientServerError") {
+            errorMsg = `الخادم ردّ بخطأ مؤقت (${err.status}) بعد محاولتين. قد يكون تسجيلك وصل فعلاً — اضغط الزر مرة أخرى بأمان، فلن يتكرر التسجيل.`;
         } else if (err.message === "INVALID_RESPONSE_FORMAT") {
             errorMsg = 'الرابط المسجل لا يؤدي إلى كود النظام. يرجى مراجعة المسؤول.';
         } else if (err.message === "OLD_OR_INVALID_CODE") {
@@ -571,8 +580,9 @@ const UserDashboard: React.FC<UserDashboardProps> = ({
             errorMsg = `خطأ: ${err.message}`;
         }
 
-        const auditTitle = err.name === "AbortError"
-          ? `انتهت مهلة تسجيل ${type === 'check-in' ? 'حضور' : 'انصراف'} بلا تأكيد (قد يكون سُجّل)`
+        const unconfirmed = err.name === "AbortError" || err.name === "TransientServerError";
+        const auditTitle = unconfirmed
+          ? `تسجيل ${type === 'check-in' ? 'حضور' : 'انصراف'} بلا تأكيد (قد يكون سُجّل)`
           : `فشل تسجيل ${type === 'check-in' ? 'حضور' : 'انصراف'}`;
         logAction(auditTitle, `السبب: ${errorMsg}${err.message ? ' | تفاصيل: ' + err.message : ''} | الإحداثيات: ${lat}, ${lng}`);
         setStatus({ type: 'error', msg: errorMsg });

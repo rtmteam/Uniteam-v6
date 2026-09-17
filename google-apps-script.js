@@ -294,6 +294,32 @@ function doPost(e) {
         return ContentService.createTextOutput(columnError);
       }
 
+      // حارس التكرار (Idempotency Guard)
+      // حين يبطؤ الخادم يُلغي التطبيق طلبه بعد مهلته بينما الخادم يُكمل الكتابة،
+      // فيرى الموظف «لم يُسجَّل شيء» ويعيد المحاولة ويُسجَّل صفٌ مكرّر.
+      // أي تسجيل لنفس الموظف ونفس النوع خلال DUPLICATE_WINDOW_MS يُعامَل
+      // على أنه التسجيل نفسه: يُرَدّ بالنجاح ولا يُضاف صف جديد.
+      var DUPLICATE_WINDOW_MS = 10 * 60 * 1000;
+      var snKey = (sn || "").toString().trim();
+      var nameKey = (data.userName || "").toString().trim();
+      var lastAttRow = attSheet.getLastRow();
+      if (lastAttRow > 1 && (snKey !== "" || nameKey !== "")) {
+        var scanCount = Math.min(300, lastAttRow - 1);
+        var recentRows = attSheet.getRange(lastAttRow - scanCount + 1, 1, scanCount, 7).getValues();
+        for (var rr = recentRows.length - 1; rr >= 0; rr--) {
+          var rowType = (recentRows[rr][6] || "").toString().trim();
+          if (rowType !== data.type) continue;
+          var rowSn = (recentRows[rr][2] || "").toString().trim();
+          var rowName = (recentRows[rr][1] || "").toString().trim();
+          var sameEmployee = snKey !== "" ? (rowSn === snKey) : (rowName === nameKey);
+          if (!sameEmployee) continue;
+          var rowTime = recentRows[rr][0] instanceof Date ? recentRows[rr][0] : new Date(recentRows[rr][0]);
+          if (!isNaN(rowTime.getTime()) && (now.getTime() - rowTime.getTime()) < DUPLICATE_WINDOW_MS) {
+            return ContentService.createTextOutput("Attendance Recorded");
+          }
+        }
+      }
+
       attSheet.appendRow([
         now,
         data.userName,
@@ -389,6 +415,109 @@ function doPost(e) {
     }
   }
 
+  // ======================================================
+  // 4. استعادة كلمة المرور — الطبقة أ: بيد المسؤول
+  // ======================================================
+  // إجراء ضيّق عمداً: يكتب عمود كلمة المرور وحده ولا يمرّ بـ updateSystem،
+  // فلا يمسّ بقية الصفوف ولا يحذف موظفاً سجّل بعد آخر مزامنة للمسؤول.
+  if (data.action === 'resetUserPassword') {
+    if (!isAdminRequest(ss, data.adminUsername, data.adminPassword)) {
+      return ContentService.createTextOutput("Error: Unauthorized. Admin credentials required.");
+    }
+
+    var lock = LockService.getScriptLock();
+    try {
+      lock.waitLock(10000);
+
+      var pwError = validateNewPassword(data.newPassword);
+      if (pwError !== "") return ContentService.createTextOutput(pwError);
+
+      var sheet = getOrCreateSheet(ss, "Users");
+      var rows = sheet.getDataRange().getValues();
+      var nid = data.nationalId ? data.nationalId.toString().trim() : "";
+      var uid = data.userId ? data.userId.toString().trim() : "";
+
+      for (var i = 1; i < rows.length; i++) {
+        var rowNid = rows[i][2] ? rows[i][2].toString().trim() : "";
+        var rowUid = rows[i][0] ? rows[i][0].toString().trim() : "";
+        if ((nid && rowNid === nid) || (uid && rowUid === uid)) {
+          sheet.getRange(i + 1, 7).setValue(data.newPassword.toString());
+          logPasswordReset(ss, rows[i][1], "إعادة تعيين بيد المسؤول",
+                           "المسؤول: " + (data.adminUsername || ""));
+          return ContentService.createTextOutput("Password Reset Successfully");
+        }
+      }
+      return ContentService.createTextOutput("Error: User Not Found");
+
+    } catch (e) {
+      return ContentService.createTextOutput("Error: Server Busy, try again");
+    } finally {
+      lock.releaseLock();
+    }
+  }
+
+  // ======================================================
+  // 5. استعادة كلمة المرور — الطبقة ب: ذاتية بالجهاز المربوط
+  // ======================================================
+  // عاملان مجتمعان: الرقم القومي + جهاز مسجَّل مسبقاً لهذا الرقم بالذات.
+  //
+  // أُسقط شرط الرقم التسلسلي عمداً: يولّده الخادم ولا يراه الموظف إلا داخل
+  // شاشته بعد الدخول، فمن نسي كلمة مروره لا يستطيع قراءته أصلاً — كان
+  // الشرط يُبطل هذا المسار كلّه. ولا يضيف أماناً يُذكر: من يملك الهاتف
+  // المربوط يفتح التطبيق بالجلسة المحفوظة ويقرأ الرقم من الشاشة.
+  //
+  // الحماية الفعلية هي الجهاز: لا تُقبل الاستعادة إلا من هاتف سبق ربطه.
+  if (data.action === 'resetPasswordSelf') {
+    var lock = LockService.getScriptLock();
+    try {
+      lock.waitLock(10000);
+
+      var sheet = getOrCreateSheet(ss, "Users");
+      var rows = sheet.getDataRange().getValues();
+
+      var nid = data.nationalId ? data.nationalId.toString().trim() : "";
+      var device = data.deviceId ? data.deviceId.toString().trim() : "";
+
+      if (nid === "" || device === "") {
+        return ContentService.createTextOutput("Error: بيانات ناقصة. يلزم الرقم القومي.");
+      }
+
+      for (var i = 1; i < rows.length; i++) {
+        var rowNid = rows[i][2] ? rows[i][2].toString().trim() : "";
+        if (rowNid !== nid) continue;
+
+        // ١) الجهاز المربوط
+        var allowed = parseDeviceIds(rows[i][5]);
+        if (allowed.indexOf(device) === -1) {
+          logPasswordReset(ss, rows[i][1], "فشل استعادة ذاتية", "جهاز غير مسجّل");
+          return ContentService.createTextOutput(
+            "Error: هذا الجهاز غير مسجّل لحسابك. راجع المسؤول لإعادة تعيين كلمة المرور."
+          );
+        }
+
+        // ٢) الخطوة الأولى تتحقّق فقط ولا تكتب شيئاً
+        if (!data.newPassword) {
+          return ContentService.createTextOutput("Verified: " + (rows[i][1] || ""));
+        }
+
+        var selfPwError = validateNewPassword(data.newPassword);
+        if (selfPwError !== "") return ContentService.createTextOutput(selfPwError);
+
+        sheet.getRange(i + 1, 7).setValue(data.newPassword.toString());
+        logPasswordReset(ss, rows[i][1], "استعادة ذاتية بالجهاز المربوط", "الجهاز: " + device);
+        return ContentService.createTextOutput("Password Reset Successfully");
+      }
+
+      // رسالة واحدة لكل حالات عدم التطابق حتى لا تكشف أي رقم قومي مسجَّل
+      return ContentService.createTextOutput("Error: البيانات غير صحيحة. راجع المسؤول.");
+
+    } catch (e) {
+      return ContentService.createTextOutput("Error: Server Busy, try again");
+    } finally {
+      lock.releaseLock();
+    }
+  }
+
   if (data.action === 'updateUserDevice') {
     var lock = LockService.getScriptLock();
     try {
@@ -453,6 +582,55 @@ function doPost(e) {
  * ملاحظة: إن لم تكن مضبوطة بعد (شيت جديد) يُسمح بالطلب الأول لتهيئتها،
  * وإلا تعذّر ضبط النظام من الصفر.
  */
+/**
+ * قواعد كلمة المرور — مطابقة لما يفرضه التطبيق في Login.tsx:78,84
+ * حتى لا تُقبل من الخادم كلمة يرفضها التطبيق عند الدخول.
+ * تُرجع رسالة الخطأ، أو "" إن كانت سليمة.
+ */
+function validateNewPassword(pw) {
+  var p = pw ? pw.toString() : "";
+  if (p.length < 6) return "Error: كلمة المرور يجب ألا تقل عن ٦ خانات.";
+  if (p.charAt(0) === "0") return "Error: كلمة المرور لا يمكن أن تبدأ بصفر.";
+  return "";
+}
+
+/**
+ * قراءة قائمة الأجهزة المسموحة من خانة واحدة.
+ * الخانة تحمل إما مصفوفة JSON (الصيغة الحالية) أو معرّفاً واحداً (صيغة قديمة).
+ */
+function parseDeviceIds(cell) {
+  var raw = cell ? cell.toString().trim() : "";
+  if (raw === "") return [];
+  if (raw.charAt(0) === "[" && raw.charAt(raw.length - 1) === "]") {
+    try {
+      var parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : [raw];
+    } catch (e) {
+      return [raw];
+    }
+  }
+  return [raw];
+}
+
+/**
+ * تسجيل كل محاولة استعادة — ناجحة أو فاشلة — في AuditLog.
+ * إعادة تعيين كلمة مرور حدث حسّاس يجب أن يترك أثراً يُراجَع.
+ */
+function logPasswordReset(ss, userName, action, details) {
+  try {
+    var auditSheet = getOrCreateSheet(ss, "AuditLog");
+    auditSheet.appendRow([
+      new Date(),
+      userName ? userName.toString() : "غير معروف",
+      action,
+      details || "",
+      "استعادة كلمة المرور"
+    ]);
+  } catch (e) {
+    // فشل التسجيل لا يُبطل العملية نفسها
+  }
+}
+
 function isAdminRequest(ss, username, password) {
   var configSheet = getOrCreateSheet(ss, "Config");
   var rows = configSheet.getDataRange().getValues();
