@@ -4,7 +4,8 @@ import { User, AppConfig, Job, Branch } from '../types';
 import { UserPlus, LogIn, LogOut, ShieldAlert, Briefcase, Loader2, Link as LinkIcon, Smartphone, AlertCircle, WifiOff, MapPin, Eye, EyeOff, FileSpreadsheet, ArrowRight, KeyRound } from 'lucide-react';
 import { getDeviceFingerprint } from '../utils';
 import { LogoMark } from './Logo';
-import ReportsView from './ReportsView';
+// التقارير تُحمَّل عند فتح تبويبها فقط — انظر LazyScreens.tsx
+import { LazyReportsView, ScreenLoader } from './LazyScreens';
 
 /**
  * مهلة مزامنة ما قبل الدخول.
@@ -669,14 +670,16 @@ export default function Login({
 
           {mode === 'reports' ? (
             <div className="pt-2">
-              <ReportsView 
-                syncUrl={adminConfig.syncUrl} 
-                adminConfig={adminConfig} 
-                onUpdateConfig={setAdminConfig} 
-                logAction={logAction} 
-                onLoginStateChange={setIsReportsLoggedIn}
-                onLogoutRef={reportsLogoutRef}
-              />
+              <ScreenLoader>
+                <LazyReportsView 
+                  syncUrl={adminConfig.syncUrl} 
+                  adminConfig={adminConfig} 
+                  onUpdateConfig={setAdminConfig} 
+                  logAction={logAction} 
+                  onLoginStateChange={setIsReportsLoggedIn}
+                  onLogoutRef={reportsLogoutRef}
+                />
+              </ScreenLoader>
             </div>
           ) : (
             <>

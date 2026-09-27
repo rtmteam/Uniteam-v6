@@ -30,6 +30,9 @@ interface UserDashboardProps {
  */
 const ATTENDANCE_TIMEOUT_MS = 45000;
 
+/** مهلة جلب server-config.json قبل التسجيل — لا يجوز أن تعلّق التسجيل */
+const CONFIG_FETCH_TIMEOUT_MS = 6000;
+
 /** عدد المحاولات الإضافية التلقائية بعد انتهاء المهلة */
 const ATTENDANCE_AUTO_RETRIES = 1;
 
@@ -404,9 +407,16 @@ const UserDashboard: React.FC<UserDashboardProps> = ({
 
         // جلب أحدث رابط من السيرفر قبل التسجيل مباشرة لضمان عدم استخدام رابط قديم
         try {
-            const configRes = await fetch('./server-config.json?t=' + Date.now());
+            // مهلة قصيرة: على شبكة ضعيفة كان هذا الطلب يعلق بلا حدّ قبل أن
+            // يبدأ إرسال التسجيل أصلاً. عند تجاوزها نُكمل بالرابط المحفوظ
+            // (نفس مسار catch أدناه)، وفحص الصيانة الدوري في App.tsx يبقى قائماً.
+            const cfgController = new AbortController();
+            const cfgTimer = setTimeout(() => cfgController.abort(), CONFIG_FETCH_TIMEOUT_MS);
+            // المؤقت يبقى حتى قراءة المحتوى كاملاً — الشبكة الضعيفة قد تعلق أثناءه أيضاً
+            const configRes = await fetch('./server-config.json?t=' + Date.now(), { signal: cfgController.signal });
             if (configRes.ok) {
                 const configData = await configRes.json();
+                clearTimeout(cfgTimer);
 
                 // فحص وضع الصيانة من نفس الاستجابة قبل إرسال أي بيانات.
                 // الفحص الدوري في App.tsx يعمل كل بضع دقائق، وهذه الفجوة

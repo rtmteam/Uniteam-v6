@@ -1,10 +1,10 @@
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { User, Branch, AttendanceRecord, AppConfig, Job, ReportAccount, VisitPlan } from './types';
 import Login from './components/Login';
-import AdminDashboard from './components/AdminDashboard';
+// الإدارة والتقارير تُحمَّل عند الحاجة فقط — انظر LazyScreens.tsx
+import { LazyAdminDashboard, LazyReportsView, ScreenLoader } from './components/LazyScreens';
 import UserDashboard from './components/UserDashboard';
-import ReportsView from './components/ReportsView';
 import { ShieldCheck, User as UserIcon, Cloud, CloudOff, RefreshCw, FileSpreadsheet, Home, Download, Share, PlusSquare, X, Wifi, LogOut, ShieldAlert, AlertTriangle, Smartphone, Settings } from 'lucide-react';
 import { syncTimeWithServer, checkDeveloperOptionsStatus, getDeviceFingerprint } from './utils';
 import { LogoMark } from './components/Logo';
@@ -15,6 +15,22 @@ import { LogoMark } from './components/Logo';
 const ADMIN_PASSWORD_SSOT = 'adminAcc';
 // ==========================================
 
+/**
+ * وصف مختصر للجهاز لعمود Device Info في شيت الأودت.
+ * كان يُرسل نص userAgent كاملاً (سطر طويل لا يُقرأ)؛ الآن تصنيف واحد.
+ * «تطبيق أندرويد» يُعرف بوجود الجسر الأصلي الذي يحقنه الـAPK وحده.
+ */
+const describeDevice = (): string => {
+  const ua = (navigator.userAgent || '').toLowerCase();
+  const b = (window as any).AndroidBridge;
+  if (b && typeof b.getAndroidId === 'function') return 'تطبيق أندرويد';
+  if (/android/.test(ua)) return 'متصفح أندرويد';
+  if (/iphone|ipad|ipod/.test(ua) || (/macintosh/.test(ua) && navigator.maxTouchPoints > 1)) return 'آيفون';
+  if (/windows/.test(ua)) return 'ويندوز';
+  if (/macintosh|mac os x/.test(ua)) return 'ماك';
+  return 'أخرى';
+};
+
 const App: React.FC = () => {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [branches, setBranches] = useState<Branch[]>([]);
@@ -23,6 +39,19 @@ const App: React.FC = () => {
   const [records, setRecords] = useState<AttendanceRecord[]>([]);
   const [allUsers, setAllUsers] = useState<User[]>([]);
   const [visitPlans, setVisitPlans] = useState<VisitPlan[]>([]);
+
+  // ---------- نطاق البيانات ----------
+  // تطبيق الموظف يطلب في مزامنته الدورية بياناته هو فقط (scope=employee):
+  // خططه وحده بدل خطط الجميع منذ البداية، وبلا حسابات التقارير.
+  // 'employee' تعني أن ما في الذاكرة جزئي — لا يصلح للوحة الإدارة، لأن حفظها
+  // يمسح شيت الخطط ويعيد كتابته مما في الجهاز فيحذف الباقي.
+  const [dataScope, setDataScope] = useState<'full' | 'employee'>(() => {
+    try { return localStorage.getItem('attendance_data_scope') === 'employee' ? 'employee' : 'full'; }
+    catch (e) { return 'full'; }
+  });
+  // مرجع للمستخدم الحالي داخل syncWithCloud (بلا اعتماديات عمداً)
+  const currentUserRef = useRef<User | null>(null);
+  useEffect(() => { currentUserRef.current = currentUser; }, [currentUser]);
   const [isSyncing, setIsSyncing] = useState(false);
   const [syncError, setSyncError] = useState(false);
   const [isOnline, setIsOnline] = useState(navigator.onLine);
@@ -164,7 +193,12 @@ const App: React.FC = () => {
       // مزامنة الوقت بالخلفية لضمان دقة ساعة التطبيق بالتوقيت المصري وحمايته من التلاعب
       syncTimeWithServer().catch(e => console.warn('Background time sync failed', e));
 
-      const fetchUrl = `${url}${url.includes('?') ? '&' : '?'}action=getData&t=${Date.now()}`;
+      // الموظف المسجَّل وحده يطلب نطاقه. شاشة الدخول (لا مستخدم) والمسؤول
+      // يطلبان كل شيء كما كان. الخادم القديم يتجاهل المعامل فيردّ بكل شيء.
+      const u = currentUserRef.current;
+      const employeeScope = !!(u && u.role !== 'admin' && u.id);
+      const scopeParam = employeeScope ? `&scope=employee&userId=${encodeURIComponent(String(u!.id))}` : '';
+      const fetchUrl = `${url}${url.includes('?') ? '&' : '?'}action=getData${scopeParam}&t=${Date.now()}`;
       const response = await fetch(fetchUrl, controller ? { signal: controller.signal } : undefined);
       if (!response.ok) throw new Error('فشل الاتصال');
       const data = await response.json();
@@ -201,6 +235,11 @@ const App: React.FC = () => {
         setVisitPlans(data.visitPlans);
         localStorage.setItem('attendance_visit_plans', JSON.stringify(data.visitPlans));
       }
+
+      // الخادم يعلن النطاق الذي ردّ به؛ الخادم القديم لا يعلنه فالبيانات كاملة
+      const receivedScope: 'full' | 'employee' = data.scope === 'employee' ? 'employee' : 'full';
+      setDataScope(receivedScope);
+      try { localStorage.setItem('attendance_data_scope', receivedScope); } catch (e) { /* التخزين محجوب */ }
       
       setConfig(prev => {
         const updatedConfig = { ...prev, lastUpdated: new Date().toISOString(), syncUrl: url, googleSheetLink: url };
@@ -237,7 +276,11 @@ const App: React.FC = () => {
     const savedUsers = localStorage.getItem('attendance_users');
     const savedReportAccounts = localStorage.getItem('attendance_report_accounts');
     
-    if (savedUser) setCurrentUser(JSON.parse(savedUser));
+    if (savedUser) {
+      const parsedUser = JSON.parse(savedUser);
+      currentUserRef.current = parsedUser;
+      setCurrentUser(parsedUser);
+    }
     if (savedBranches) setBranches(JSON.parse(savedBranches));
     if (savedJobs) setJobs(JSON.parse(savedJobs));
     if (savedPlans) setVisitPlans(JSON.parse(savedPlans));
@@ -263,6 +306,13 @@ const App: React.FC = () => {
       syncWithCloud(urlToSync);
     }
   }, []);
+
+  // المسؤول على جهاز بياناته جزئية (كان عليه موظف): مزامنة كاملة فوراً
+  useEffect(() => {
+    if (currentUser?.role === 'admin' && dataScope === 'employee' && config.syncUrl && isOnline) {
+      syncWithCloud(config.syncUrl, true);
+    }
+  }, [currentUser, dataScope, config.syncUrl, isOnline, syncWithCloud]);
 
   // Continuous Auto-Reconnect & Periodic Sync
   useEffect(() => {
@@ -436,7 +486,7 @@ const App: React.FC = () => {
         user: currentUser ? `${currentUser.fullName} (${currentUser.role})` : 'Guest',
         auditAction: action,
         details: details,
-        deviceInfo: navigator.userAgent,
+        deviceInfo: describeDevice(),
         spreadsheetId: config.auditLogUrl || ''
       };
       
@@ -684,7 +734,9 @@ const App: React.FC = () => {
 
       <main className={`flex-1 w-full mx-auto pb-24 ${currentUser?.role === 'admin' ? 'admin-wide py-4 md:py-6' : 'max-w-6xl p-4 md:p-6'}`}>
         {activeView === 'reports' && !currentUser ? (
-          <ReportsView syncUrl={config.syncUrl} adminConfig={config} onUpdateConfig={handleUpdateConfig} logAction={logAction} />
+          <ScreenLoader>
+            <LazyReportsView syncUrl={config.syncUrl} adminConfig={config} onUpdateConfig={handleUpdateConfig} logAction={logAction} />
+          </ScreenLoader>
         ) : (
           !currentUser ? (
             <Login
@@ -696,15 +748,29 @@ const App: React.FC = () => {
               onOpenReports={() => setActiveView('reports')}
             />
           ) : (
-            currentUser.role === 'admin' ? (
-              <AdminDashboard 
-                branches={branches} setBranches={setBranches} jobs={jobs} setJobs={setJobs}
-                records={records} config={config} setConfig={setConfig} allUsers={allUsers} setAllUsers={setAllUsers}
-                reportAccounts={reportAccounts} setReportAccounts={setReportAccounts}
-                visitPlans={visitPlans} setVisitPlans={setVisitPlans}
-                onRefresh={() => syncWithCloud(config.syncUrl)} isSyncing={isSyncing}
-                logAction={logAction}
-              />
+            currentUser.role === 'admin' && dataScope === 'employee' ? (
+              // لا تُفتح لوحة الإدارة ببيانات جزئية — حفظها كان سيحذف ما ليس فيها
+              <div className="bg-slate-800 rounded-3xl border border-slate-700 p-8 text-center text-white max-w-md mx-auto">
+                <RefreshCw size={30} className={`mx-auto text-blue-400 mb-4 ${isSyncing ? 'animate-spin' : ''}`} />
+                <h3 className="text-lg font-black mb-2">جارٍ تحميل بيانات الإدارة الكاملة…</h3>
+                <p className="text-sm text-slate-400 leading-relaxed mb-6">
+                  {isOnline ? 'لحظات وتفتح لوحة الإدارة.' : 'لا يوجد اتصال بالإنترنت. لوحة الإدارة تحتاج البيانات الكاملة من الخادم.'}
+                </p>
+                <button type="button" onClick={() => config.syncUrl && syncWithCloud(config.syncUrl, true)} disabled={isSyncing} className="ut-btn ut-btn--brand mx-auto" style={{ minHeight: 44, paddingInline: 20 }}>
+                  <RefreshCw size={16} /> إعادة المحاولة
+                </button>
+              </div>
+            ) : currentUser.role === 'admin' ? (
+              <ScreenLoader>
+                <LazyAdminDashboard 
+                  branches={branches} setBranches={setBranches} jobs={jobs} setJobs={setJobs}
+                  records={records} config={config} setConfig={setConfig} allUsers={allUsers} setAllUsers={setAllUsers}
+                  reportAccounts={reportAccounts} setReportAccounts={setReportAccounts}
+                  visitPlans={visitPlans} setVisitPlans={setVisitPlans}
+                  onRefresh={() => syncWithCloud(config.syncUrl)} isSyncing={isSyncing}
+                  logAction={logAction}
+                />
+              </ScreenLoader>
             ) : (
               <UserDashboard 
                 user={currentUser} branches={branches} records={records} setRecords={setRecords}
